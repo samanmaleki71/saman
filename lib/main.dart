@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:math';
+
 import 'package:faryazan_uploader/http_override.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
@@ -12,7 +13,7 @@ import 'package:webview_flutter_android/webview_flutter_android.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   HttpOverrides.global = MyHttpOverrides();
-   runApp(const MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -38,8 +39,10 @@ class UploaderWebView extends StatefulWidget {
 class _UploaderWebViewState extends State<UploaderWebView> {
   late final WebViewController _controller;
 
-  // صفحه‌ای که شورتکد افزونه داخلش هست:
-  static const String url = 'https://faryazandecor.com/add';
+  static const String defaultUrl = 'https://faryazandecor.com/add';
+
+  final TextEditingController _addressCtrl = TextEditingController();
+  String _currentUrl = defaultUrl;
 
   @override
   void initState() {
@@ -48,34 +51,89 @@ class _UploaderWebViewState extends State<UploaderWebView> {
     final params = const PlatformWebViewControllerCreationParams();
     _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..loadRequest(Uri.parse(url));
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onUrlChange: (change) {
+            final u = change.url;
+            if (u != null && u.isNotEmpty) {
+              setState(() {
+                _currentUrl = u;
+                _addressCtrl.text = u;
+              });
+            }
+          },
+          onPageFinished: (u) {
+            if (u.isNotEmpty) {
+              setState(() {
+                _currentUrl = u;
+                _addressCtrl.text = u;
+              });
+            }
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse(defaultUrl));
+
+    _addressCtrl.text = defaultUrl;
 
     // فقط اندروید: هندل کردن <input type="file"> داخل WebView
     final platform = _controller.platform;
     if (platform is AndroidWebViewController) {
       platform.setOnShowFileSelector((FileSelectorParams p) async {
-        final picker = ImagePicker();
+        try {
+          final picker = ImagePicker();
 
-        final List<XFile> picked;
-        if (p.mode == FileSelectorMode.openMultiple) {
-          picked = await picker.pickMultiImage(imageQuality: 95);
-        } else {
-          final one = await picker.pickImage(
-            source: ImageSource.gallery,
-            imageQuality: 95,
-          );
-          picked = one == null ? <XFile>[] : <XFile>[one];
+          final List<XFile> picked;
+          if (p.mode == FileSelectorMode.openMultiple) {
+            picked = await picker.pickMultiImage(imageQuality: 95);
+          } else {
+            final one = await picker.pickImage(
+              source: ImageSource.gallery,
+              imageQuality: 95,
+            );
+            picked = one == null ? <XFile>[] : <XFile>[one];
+          }
+
+          if (picked.isEmpty) return <String>[];
+
+          final outPaths = <String>[];
+          for (final x in picked) {
+            // اگر کراپ/نور خطا داد یا نمایش داده نشد، کرش نکنه و فایل اصلی رو بده
+            String finalPath = x.path;
+            try {
+              final editedPath = await _cropAndBrightness(x.path);
+              if (editedPath != null && editedPath.isNotEmpty) {
+                finalPath = editedPath;
+              }
+            } catch (_) {
+              // fallback: original path
+              finalPath = x.path;
+            }
+            outPaths.add(finalPath);
+          }
+
+          return outPaths; // مسیر فایل‌های نهایی برای آپلود در فرم سایت
+        } catch (_) {
+          // مهم: هیچ وقت باعث خروج/کرش نشه
+          return <String>[];
         }
-
-        if (picked.isEmpty) return <String>[];
-
-        final outPaths = <String>[];
-        for (final x in picked) {
-          final editedPath = await _cropAndBrightness(x.path);
-          if (editedPath != null) outPaths.add(editedPath);
-        }
-        return outPaths; // مسیر فایل‌های نهایی برای آپلود در فرم سایت
       });
+    }
+  }
+
+  Future<void> _goToAddressBarUrl() async {
+    final raw = _addressCtrl.text.trim();
+    if (raw.isEmpty) return;
+
+    String u = raw;
+    if (!u.startsWith('http://') && !u.startsWith('https://')) {
+      u = 'https://$u';
+    }
+
+    try {
+      await _controller.loadRequest(Uri.parse(u));
+    } catch (_) {
+      // اگر آدرس غلط بود، هیچی
     }
   }
 
@@ -90,7 +148,9 @@ class _UploaderWebViewState extends State<UploaderWebView> {
         ),
       ],
     );
-    if (cropped == null) return null;
+
+    // اگر کاربر Cancel زد، همون فایل اصلی رو بده (تا اپ خارج نشه)
+    if (cropped == null) return inputPath;
 
     // 2) Brightness (اختیاری)
     final brightness = await _askBrightness(); // -100..+100 یا null
@@ -148,11 +208,80 @@ class _UploaderWebViewState extends State<UploaderWebView> {
     );
   }
 
+  Widget _addressBar() {
+    return Material(
+      elevation: 2,
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: 'Back',
+                onPressed: () async {
+                  final can = await _controller.canGoBack();
+                  if (can) {
+                    await _controller.goBack();
+                  } else {
+                    if (mounted) Navigator.maybePop(context);
+                  }
+                },
+                icon: const Icon(Icons.arrow_back),
+              ),
+              IconButton(
+                tooltip: 'Refresh',
+                onPressed: () => _controller.reload(),
+                icon: const Icon(Icons.refresh),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _addressCtrl,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    hintText: 'آدرس را وارد کن…',
+                  ),
+                  keyboardType: TextInputType.url,
+                  textInputAction: TextInputAction.go,
+                  onSubmitted: (_) => _goToAddressBarUrl(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: _goToAddressBarUrl,
+                child: const Text('Go'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _addressCtrl.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
+    // _currentUrl فقط برای اینکه بفهمی آپدیت میشه (فعلاً لازم نیست نمایش جداگانه بدیم)
+    // ignore: unused_local_variable
+    final _ = _currentUrl;
+
     return Scaffold(
-      body: SafeArea(
-        child: WebViewWidget(controller: _controller),
+      body: Column(
+        children: [
+          _addressBar(),
+          Expanded(
+            child: SafeArea(
+              top: false,
+              child: WebViewWidget(controller: _controller),
+            ),
+          ),
+        ],
       ),
     );
   }
